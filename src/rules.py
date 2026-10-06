@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from .domain import (
     ConflictError,
     InvalidTransition,
+    NotFoundError,
     PermissionDenied,
     ValidationError,
 )
@@ -28,6 +29,52 @@ def _validate_lab_result(actor, entity, data, lookup):
         raise ValidationError("lab result must be positive or negative")
 
 
+def _validate_handover(actor, data, lookup):
+    record_ids = data.get("record_ids")
+    if not isinstance(record_ids, list) or not record_ids:
+        raise ValidationError("record_ids must be a non-empty list")
+    from_area = data.get("from_area")
+    to_area = data.get("to_area")
+    if not from_area or not to_area:
+        raise ValidationError("from_area and to_area are required")
+    if from_area == to_area:
+        raise ValidationError("from_area and to_area must differ")
+    for rid in record_ids:
+        if not any(lookup(kind, "id", rid) for kind in ("observation", "sample", "cluster")):
+            raise NotFoundError("record not found: " + rid)
+    if actor.role == "field" and actor.area is not None and from_area != actor.area:
+        raise PermissionDenied("field actor can only hand over their own area")
+
+
+def _validate_confirm_cluster(actor, entity, data, lookup):
+    obs_ids = data.get("observation_ids")
+    if not isinstance(obs_ids, list) or len(obs_ids) < 3:
+        raise ValidationError("cluster requires at least 3 observations")
+    observations = []
+    for oid in obs_ids:
+        obs = _find_one(lookup, "observation", "id", oid)
+        if not obs:
+            raise ValidationError("observation not found: " + oid)
+        observations.append(obs["data"])
+    if not is_cluster(observations):
+        raise ValidationError("observations do not form a cluster")
+    centroid = data.get("centroid")
+    if not isinstance(centroid, (list, tuple)) or len(centroid) != 2:
+        raise ValidationError("centroid must be [lat, lon]")
+    return {}
+
+
+def is_confirmed(kind, status):
+    return status in CONFIRMED_STATUSES.get(kind, ())
+
+
+CONFIRMED_STATUSES = {
+    "observation": ("submitted", "sampled"),
+    "sample": ("resulted", "closed"),
+    "cluster": ("confirmed",),
+}
+
+
 def _haversine_km(lat1, lon1, lat2, lon2):
     from math import asin, cos, radians, sin, sqrt
     dlat = radians(lat2 - lat1)
@@ -51,18 +98,78 @@ def is_cluster(observations, max_days=14, radius_km=10):
     return same_window and close
 
 
-CUSTOM_CREATE = {'observation': _validate_observation, 'sample': _validate_sample}
-CUSTOM_TRANSITIONS = {('sample', 'lab_result'): _validate_lab_result}
+CUSTOM_CREATE = {
+    'observation': _validate_observation,
+    'sample': _validate_sample,
+    'handover': _validate_handover,
+}
+CUSTOM_TRANSITIONS = {
+    ('sample', 'lab_result'): _validate_lab_result,
+    ('cluster', 'confirm_cluster'): _validate_confirm_cluster,
+}
 
 
 class RuleEngine:
     ALIASES = {'observations': 'observation', 'samples': 'sample', 'clusters': 'cluster'}
-    INITIAL_STATUS = {'observation': 'captured', 'sample': 'collected', 'cluster': 'draft'}
-    TRANSITIONS = {'observation': {'submit': (('captured',), 'submitted'), 'reject': (('submitted',), 'rejected'), 'link_sample': (('submitted',), 'sampled')}, 'sample': {'send_lab': (('collected',), 'in_lab'), 'lab_result': (('in_lab',), 'resulted'), 'retest': (('resulted',), 'in_lab'), 'close': (('resulted',), 'closed')}, 'cluster': {'confirm_cluster': (('draft',), 'confirmed'), 'dismiss': (('draft',), 'dismissed')}}
-    CREATE_REQUIRED = {'observation': ('event_id', 'species', 'location', 'observed_at', 'lat', 'lon'), 'sample': ('observation_id', 'sample_code'), 'cluster': ('region',)}
-    ACTION_REQUIRED = {('observation', 'submit'): ('location', 'observed_at'), ('observation', 'reject'): ('reason',), ('observation', 'link_sample'): ('sample_id',), ('sample', 'send_lab'): ('lab_id',), ('sample', 'lab_result'): ('result', 'result_at'), ('sample', 'retest'): ('reason',), ('sample', 'close'): ('outcome',), ('cluster', 'confirm_cluster'): ('observation_ids', 'centroid'), ('cluster', 'dismiss'): ('reason',)}
-    CREATE_ROLES = {'observation': ('admin', 'field'), 'sample': ('admin', 'field'), 'cluster': ('admin', 'epidemiologist')}
-    ROLE_ACTIONS = {'submit': ('admin', 'field'), 'reject': ('admin', 'epidemiologist'), 'link_sample': ('admin', 'field'), 'send_lab': ('admin', 'field'), 'lab_result': ('admin', 'lab'), 'retest': ('admin', 'lab'), 'close': ('admin', 'epidemiologist'), 'confirm_cluster': ('admin', 'epidemiologist'), 'dismiss': ('admin', 'epidemiologist')}
+    INITIAL_STATUS = {
+        'observation': 'captured',
+        'sample': 'collected',
+        'cluster': 'draft',
+        'handover': 'completed',
+    }
+    TRANSITIONS = {
+        'observation': {
+            'submit': (('captured',), 'submitted'),
+            'reject': (('submitted',), 'rejected'),
+            'link_sample': (('submitted',), 'sampled'),
+            'correct': (('captured', 'submitted', 'sampled'), None),
+        },
+        'sample': {
+            'send_lab': (('collected',), 'in_lab'),
+            'lab_result': (('in_lab',), 'resulted'),
+            'retest': (('resulted',), 'in_lab'),
+            'close': (('resulted',), 'closed'),
+        },
+        'cluster': {
+            'confirm_cluster': (('draft', 'invalid'), 'confirmed'),
+            'dismiss': (('draft', 'invalid'), 'dismissed'),
+        },
+    }
+    CREATE_REQUIRED = {
+        'observation': ('event_id', 'species', 'location', 'observed_at', 'lat', 'lon'),
+        'sample': ('observation_id', 'sample_code'),
+        'cluster': ('region',),
+        'handover': ('from_area', 'to_area', 'record_ids'),
+    }
+    ACTION_REQUIRED = {
+        ('observation', 'submit'): ('location', 'observed_at'),
+        ('observation', 'reject'): ('reason',),
+        ('observation', 'link_sample'): ('sample_id',),
+        ('sample', 'send_lab'): ('lab_id',),
+        ('sample', 'lab_result'): ('result', 'result_at'),
+        ('sample', 'retest'): ('reason',),
+        ('sample', 'close'): ('outcome',),
+        ('cluster', 'confirm_cluster'): ('observation_ids', 'centroid'),
+        ('cluster', 'dismiss'): ('reason',),
+    }
+    CREATE_ROLES = {
+        'observation': ('admin', 'field'),
+        'sample': ('admin', 'field'),
+        'cluster': ('admin', 'epidemiologist'),
+        'handover': ('admin', 'field'),
+    }
+    ROLE_ACTIONS = {
+        'submit': ('admin', 'field'),
+        'reject': ('admin', 'epidemiologist'),
+        'link_sample': ('admin', 'field'),
+        'send_lab': ('admin', 'field'),
+        'lab_result': ('admin', 'lab'),
+        'retest': ('admin', 'lab'),
+        'close': ('admin', 'epidemiologist'),
+        'confirm_cluster': ('admin', 'epidemiologist'),
+        'dismiss': ('admin', 'epidemiologist'),
+        'correct': ('admin', 'field'),
+    }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -92,9 +199,12 @@ class RuleEngine:
         self._ensure_role(actor, self.CREATE_ROLES.get(kind, ("admin",)))
         self._require(data, self.CREATE_REQUIRED.get(kind, ()))
         custom = CUSTOM_CREATE.get(kind)
-        if custom:
-            custom(actor, data, lookup)
-        return dict(data)
+        extra = custom(actor, data, lookup) if custom else {}
+        payload = dict(data)
+        if extra:
+            payload.update(extra)
+        self._ensure_area(actor, kind, payload, lookup)
+        return payload
 
     def validate_transition(self, actor, entity, action, data, lookup=None):
         kind = self.normalize_kind(entity["kind"])
@@ -111,12 +221,37 @@ class RuleEngine:
         )
         self._ensure_role(actor, allowed_roles)
         self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
+        self._ensure_area(actor, kind, entity["data"], lookup)
         custom = CUSTOM_TRANSITIONS.get((kind, action))
         extra = custom(actor, entity, data, lookup) if custom else {}
         patch = dict(data)
         if extra:
             patch.update(extra)
+        if next_status is None:
+            next_status = entity["status"]
         return next_status, patch
+
+    @staticmethod
+    def _ensure_area(actor, kind, data, lookup=None):
+        if kind not in ("observation", "sample", "cluster"):
+            return
+        if not data.get("area"):
+            if actor.role == "field" and actor.area is not None:
+                data["area"] = actor.area
+            elif kind == "observation":
+                data["area"] = data.get("location")
+            elif kind == "cluster":
+                data["area"] = data.get("region")
+            elif kind == "sample":
+                obs = _find_one(lookup, "observation", "id", data.get("observation_id"))
+                if obs:
+                    data["area"] = obs["data"].get("area") or obs["data"].get("location")
+        if actor.role == "field" and actor.area is not None:
+            if data.get("area") != actor.area:
+                raise PermissionDenied(
+                    "field actor cannot operate outside their area: %s != %s"
+                    % (data.get("area"), actor.area)
+                )
 
 
 def _find_one(lookup, kind, field, value):

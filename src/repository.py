@@ -140,6 +140,35 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def transfer_area(self, record_ids, to_area):
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            transferred = []
+            for rid in record_ids:
+                row = connection.execute(
+                    "SELECT id, data FROM entities WHERE id = ?", (rid,)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + rid)
+                data = json.loads(row["data"])
+                data["area"] = to_area
+                payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+                connection.execute(
+                    "UPDATE entities SET data = ?, version = version + 1, updated_at = ? "
+                    "WHERE id = ?",
+                    (payload, now, rid),
+                )
+                transferred.append(rid)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return transferred
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(
