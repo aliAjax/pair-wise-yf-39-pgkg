@@ -19,10 +19,13 @@
   <pre id="result">等待操作</pre>
   <h2>常用接口</h2>
   <pre>GET  /health
-GET  /api/&lt;kind&gt;
+GET  /api/&lt;kind&gt;?status=&amp;region=
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+POST /api/entities/&lt;id&gt;/actions
+POST /api/handovers        {"from_region","to_region","items":[{"id","kind"}]}
+POST /api/sync             {"batch_id":"...","items":[...]}
+请求头：X-User-Id / X-Role / X-Region（field 必填片区）</pre>
 </main>
 <script>
 async function checkHealth() {

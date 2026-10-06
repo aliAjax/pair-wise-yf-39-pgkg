@@ -43,7 +43,8 @@ class SQLiteRepository:
                     from_status TEXT,
                     to_status TEXT NOT NULL,
                     detail TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    dedupe_key TEXT UNIQUE
                 );
                 CREATE INDEX IF NOT EXISTS idx_audit_entity
                     ON audit_log(entity_id, id);
@@ -54,7 +55,26 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS sync_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    actor_id TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
             """)
+            self._migrate(connection)
+
+    def _migrate(self, connection):
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(audit_log)").fetchall()
+        }
+        if "dedupe_key" not in columns:
+            connection.execute("ALTER TABLE audit_log ADD COLUMN dedupe_key TEXT")
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_dedupe "
+            "ON audit_log(dedupe_key) WHERE dedupe_key IS NOT NULL"
+        )
 
     @staticmethod
     def _entity_from_row(row):
@@ -87,7 +107,7 @@ class SQLiteRepository:
             ).fetchone()
         return self._entity_from_row(row) if row else None
 
-    def list_entities(self, kind=None, status=None):
+    def list_entities(self, kind=None, status=None, region=None):
         clauses = []
         params = []
         if kind:
@@ -101,7 +121,10 @@ class SQLiteRepository:
             rows = connection.execute(
                 "SELECT * FROM entities" + where + " ORDER BY created_at, id", params
             ).fetchall()
-        return [self._entity_from_row(row) for row in rows]
+        items = [self._entity_from_row(row) for row in rows]
+        if region:
+            items = [item for item in items if item["data"].get("region") == region]
+        return items
 
     def find_entities(self, kind, field, value):
         return [
@@ -140,22 +163,93 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
-    def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
-        with self._connect() as connection:
+    def transfer_handover_item(self, handover_id, item, to_region, actor, index):
+        """Move one handover item to the receiving district.
+
+        Each item runs in its own transaction and is marked on the handover
+        inside the same commit, so an interrupted handover can resume without
+        moving the same record twice or double-writing audit rows.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (item["id"],)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + item["id"])
+            handover_row = connection.execute(
+                "SELECT data, version FROM entities WHERE id = ?", (handover_id,)
+            ).fetchone()
+            handover_data = json.loads(handover_row["data"])
+            entry = handover_data["items"][index]
+            if entry.get("status") == "done":
+                connection.commit()
+                return None
+            entity_data = json.loads(row["data"])
+            from_region = entity_data.get("region")
+            now = utcnow()
+            entity_data["region"] = to_region
             connection.execute(
-                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "UPDATE entities SET data = ?, version = version + 1, updated_at = ? WHERE id = ?",
+                (json.dumps(entity_data, ensure_ascii=False, sort_keys=True), now, item["id"]),
+            )
+            entry["status"] = "done"
+            connection.execute(
+                "UPDATE entities SET data = ?, version = version + 1, updated_at = ? WHERE id = ?",
+                (json.dumps(handover_data, ensure_ascii=False, sort_keys=True), now, handover_id),
+            )
+            connection.execute(
+                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, "
+                "to_status, detail, created_at, dedupe_key) "
+                "VALUES (?, ?, ?, 'transfer', ?, ?, ?, ?, ?)",
                 (
-                    entity_id,
-                    actor_id,
-                    actor_role,
-                    action,
-                    from_status,
-                    to_status,
-                    json.dumps(detail, ensure_ascii=False, sort_keys=True),
-                    utcnow(),
+                    item["id"],
+                    actor.user_id,
+                    actor.role,
+                    from_region,
+                    to_region,
+                    json.dumps(
+                        {"handover_id": handover_id, "from_region": from_region,
+                         "to_region": to_region},
+                        ensure_ascii=False, sort_keys=True,
+                    ),
+                    now,
+                    "handover:%s:%s" % (handover_id, item["id"]),
                 ),
             )
+            connection.commit()
+            return {"id": item["id"], "kind": item["kind"], "from_region": from_region,
+                    "to_region": to_region}
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def append_audit(self, entity_id, actor_id, actor_role, action, from_status,
+                     to_status, detail, dedupe_key=None):
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, "
+                    "from_status, to_status, detail, created_at, dedupe_key) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        entity_id,
+                        actor_id,
+                        actor_role,
+                        action,
+                        from_status,
+                        to_status,
+                        json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                        utcnow(),
+                        dedupe_key,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            return False
+        return True
 
     def list_audit(self, entity_id=None):
         with self._connect() as connection:
@@ -194,6 +288,22 @@ class SQLiteRepository:
                 "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
+            )
+
+    def get_sync_batch(self, batch_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT summary FROM sync_batches WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+        return json.loads(row["summary"]) if row else None
+
+    def save_sync_batch(self, batch_id, actor_id, summary):
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO sync_batches(batch_id, actor_id, summary, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (batch_id, actor_id, json.dumps(summary, ensure_ascii=False, sort_keys=True),
+                 utcnow()),
             )
 
     def ping(self):

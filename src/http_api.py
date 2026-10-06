@@ -94,9 +94,10 @@ def create_handler(service, rules, static_dir):
                         return self._send(200, service.get(parts[2]))
                     query = parse_qs(parsed.query)
                     status = query.get("status", [None])[0]
+                    region = query.get("region", [None])[0]
                     return self._send(
                         200,
-                        {"items": service.list(parts[1], status=status)},
+                        {"items": service.list(parts[1], status=status, region=region)},
                     )
                 raise NotFoundError("not found")
             except Exception as exc:
@@ -137,6 +138,14 @@ def create_handler(service, rules, static_dir):
                     return self._send(
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
+                    )
+                if parts == ["api", "sync"]:
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.sync_batch(
+                            actor, body.pop("batch_id", None), body.pop("items", [])
+                        ),
                     )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
